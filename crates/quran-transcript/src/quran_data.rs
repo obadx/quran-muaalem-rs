@@ -35,6 +35,12 @@ pub struct LoadedAya {
     pub uthmani: String,
     #[serde(rename = "@imlaey")]
     pub imlaey: String,
+    /// Bismillah in Uthmani script (first aya of every sura except 1 and 9).
+    #[serde(rename = "@bismillah_uthmani", default)]
+    pub bismillah_uthmani: Option<String>,
+    /// Bismillah in Imlaey script (first aya of every sura except 1 and 9).
+    #[serde(rename = "@bismillah_imlaey", default)]
+    pub bismillah_imlaey: Option<String>,
 }
 
 static QURAN_TEXT: LazyLock<LoadedQuranDocument> = LazyLock::new(|| {
