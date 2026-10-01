@@ -12,3 +12,6 @@ license = "Apache-2.0"
 repository = "https://github.com/obadx/muaalem-engine"
 homepage = "https://github.com/obadx/muaalem-engine"
 description = " بفضل الله وحده لا شريك له: محرك المعلم القرآني لتصحيح تلاوة القرآن الكريم من حروف وصفات وتجويد يعمل في أي مكان وب SKD ل Python, Kotlin, Swift عال الأداء بلغة ال Rust "
+
+[workspace.dependencies]
+boltffi = "0.30.1"

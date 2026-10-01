@@ -1,5 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use boltffi::export;
+
+/// Engine version. Throwaway export proving the BoltFFI toolchain end to end.
+#[export]
+pub fn version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[cfg(test)]
@@ -7,8 +11,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    fn version_matches_crate() {
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
     }
 }

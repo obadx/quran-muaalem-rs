@@ -1,0 +1,87 @@
+name: Bindings
+
+# Packs each BoltFFI binding of the engine and runs its smoke test
+# (crates/engine/tests/bindings/run.sh).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/engine/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bindings.yml"
+  pull_request:
+    paths:
+      - "crates/engine/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bindings.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BOLTFFI_VERSION: 0.30.1
+
+jobs:
+  bindings:
+    name: ${{ matrix.lang }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { lang: python, os: ubuntu-latest }
+          - { lang: java, os: ubuntu-latest }
+          # Android Kotlin bindings on the desktop JVM; the runner image ships the Android NDK
+          - { lang: kotlin, os: ubuntu-latest }
+          - { lang: dart, os: ubuntu-latest }
+          # Xcode + Swift come preinstalled on macOS runners
+          - { lang: swift, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bindings-${{ matrix.lang }}
+
+      - name: Cache boltffi CLI
+        id: boltffi-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/boltffi
+          key: boltffi-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.BOLTFFI_VERSION }}
+      - name: Install boltffi CLI
+        if: steps.boltffi-cache.outputs.cache-hit != 'true'
+        run: cargo install boltffi_cli --version "$BOLTFFI_VERSION" --locked
+
+      - if: matrix.lang == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: matrix.lang == 'java' || matrix.lang == 'kotlin'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install kotlinc
+        if: matrix.lang == 'kotlin'
+        run: |
+          if ! command -v kotlinc >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/kotlinc.zip" \
+              https://github.com/JetBrains/kotlin/releases/download/v2.2.20/kotlin-compiler-2.2.20.zip
+            unzip -q "$RUNNER_TEMP/kotlinc.zip" -d "$RUNNER_TEMP"
+            echo "$RUNNER_TEMP/kotlinc/bin" >> "$GITHUB_PATH"
+          fi
+      - if: matrix.lang == 'dart'
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Run ${{ matrix.lang }} smoke test
+        run: bash crates/engine/tests/bindings/run.sh ${{ matrix.lang }}
