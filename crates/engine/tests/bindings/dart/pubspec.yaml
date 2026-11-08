@@ -1,0 +1,17 @@
+# Workspace root for the generated BoltFFI Dart package (it declares
+# `resolution: workspace`) and the smoke tests that use it.
+name: engine_bindings_test
+publish_to: none
+
+environment:
+  sdk: ^3.10.8
+
+workspace:
+  - generated/quran_muaalem_engine
+
+dependencies:
+  quran_muaalem_engine:
+    path: generated/quran_muaalem_engine
+
+dev_dependencies:
+  test: ^1.25.0
