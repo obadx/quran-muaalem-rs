@@ -2,8 +2,8 @@ name: Bindings
 
 # Packs each BoltFFI binding of the engine and runs its smoke test via the root Makefile
 # (`make test-bind-<lang>` = `make doctor-<lang>` + crates/engine/tests/bindings/run.sh).
-# Language SDKs come from the official actions/setup-* actions; `make bind-<lang>` is the
-# local equivalent, used here only where no setup action exists (kotlinc).
+# Language SDKs come from the official actions/setup-* actions where available; `make bind-<lang>`
+# builds the rest from source (CPython and kotlinc).
 on:
   push:
     branches: [main]
@@ -64,14 +64,30 @@ jobs:
         run: make install-boltffi
 
       - if: matrix.lang == 'python'
-        uses: actions/setup-python@v5
+        name: Install Python build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zlib1g-dev libssl-dev libffi-dev libbz2-dev \
+            libreadline-dev libsqlite3-dev liblzma-dev libzstd-dev
+      - if: matrix.lang == 'python'
+        name: Cache CPython build
+        uses: actions/cache@v4
         with:
-          python-version: "3.12"
+          path: .toolchains/python-3.15.2
+          key: cpython-${{ runner.os }}-${{ runner.arch }}-3.15.2
+      - if: matrix.lang == 'python'
+        name: Build CPython
+        run: make bind-python
       - if: matrix.lang == 'java' || matrix.lang == 'kotlin'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
+      # The Ubuntu runner ships clang, but Java/Kotlin need it for the desktop JNI
+      # link; install it explicitly so a runner image change cannot break the job.
+      - if: matrix.lang == 'java' || matrix.lang == 'kotlin'
+        name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
       - name: Install kotlinc
         if: matrix.lang == 'kotlin'
         run: |
@@ -85,6 +101,9 @@ jobs:
         uses: dart-lang/setup-dart@v1
         with:
           sdk: stable
+      - if: matrix.lang == 'swift'
+        name: Show Swift toolchain
+        run: swift --version && xcodebuild -version
 
       - name: Run ${{ matrix.lang }} smoke test
         run: make test-bind-${{ matrix.lang }}

@@ -12,6 +12,11 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 tests=tests/bindings
 
+ROOT="$(cd ../.. && pwd)"
+TC_DIR="$ROOT/.toolchains"
+PYTHON_VERSION=3.15.2 # keep in sync with toolchains.sh
+PYTHON_BIN="$TC_DIR/python-$PYTHON_VERSION/bin/python3"
+
 ENGINE_VERSION="$(cargo pkgid | sed 's/.*[@#]//')"
 export ENGINE_VERSION
 
@@ -20,11 +25,29 @@ case "${OSTYPE:-}" in
     *) classpath_sep=":" ;;
 esac
 
+python_interpreter() {
+    if [ -n "${PYTHON:-}" ]; then
+        if [ ! -x "$PYTHON" ] && ! command -v "$PYTHON" >/dev/null 2>&1; then
+            echo "error: PYTHON=$PYTHON is not an executable interpreter" >&2
+            return 1
+        fi
+        printf '%s\n' "$PYTHON"
+    elif [ -x "$PYTHON_BIN" ]; then
+        printf '%s\n' "$PYTHON_BIN"
+    else
+        echo "error: Python $PYTHON_VERSION is not installed at $PYTHON_BIN" >&2
+        echo "       run 'make bind-python' first" >&2
+        return 1
+    fi
+}
+
 run_python() {
-    boltffi pack python --release
+    local python_cmd
+    python_cmd="$(python_interpreter)"
+    boltffi pack python --release --python "$python_cmd"
 
     local venv="$tests/python/.venv"
-    "${PYTHON:-python3}" -m venv "$venv"
+    "$python_cmd" -m venv "$venv"
     local py="$venv/bin/python"
     [ -x "$py" ] || py="$venv/Scripts/python.exe"
 

@@ -18,7 +18,14 @@ DART_VERSION=3.13.5
 DART_MIN_VERSION=3.10.8 # the generated pubspec requires sdk ^3.10.8
 JDK_MAJOR=21
 NDK_VERSION=r27c
-PYTHON_VERSION=3.12
+# Official CPython, built from source into .toolchains/. The interpreter is never taken
+# from the system: pip needs development headers and a compiler for the wheel's C bridge.
+PYTHON_VERSION=3.15.2
+PYTHON_MIN_VERSION=3.15.2
+PYTHON_SHA256=f74e1db0eabd651cd01e4e2a00201bd41866abe74869ab716f9bf33cbbaa0943
+PYTHON_SOURCE_URL="https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz"
+PYTHON_PREFIX="$TC_DIR/python-$PYTHON_VERSION"
+PYTHON_BIN="$PYTHON_PREFIX/bin/python3"
 
 boltffi_version() {
     sed -n 's/^boltffi = "\(.*\)"/\1/p' "$ROOT/Cargo.toml"
@@ -29,6 +36,14 @@ boltffi_version() {
 setup_env() {
     mkdir -p "$TC_DIR/bin"
     export PATH="$TC_DIR/bin:$PATH"
+    # Default to the downloaded CPython; never fall back to the system interpreter.
+    # An explicit PYTHON=... still wins (see README).
+    if [ -x "$PYTHON_BIN" ]; then
+        export PATH="$PYTHON_PREFIX/bin:$PATH"
+        if [ -z "${PYTHON:-}" ]; then
+            export PYTHON="$PYTHON_BIN"
+        fi
+    fi
     if [ -d "$TC_DIR/jdk" ]; then
         export JAVA_HOME="$TC_DIR/jdk"
         export PATH="$JAVA_HOME/bin:$PATH"
@@ -87,6 +102,27 @@ version_ge() { # $1 >= $2, dotted versions
     return 0
 }
 
+cpu_count() { # portable across Linux and macOS (macOS has no nproc)
+    if command -v nproc >/dev/null 2>&1; then
+        nproc
+    elif command -v sysctl >/dev/null 2>&1; then
+        sysctl -n hw.ncpu
+    else
+        getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1
+    fi
+}
+
+sha256_file() { # file -> hex digest
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        echo "need sha256sum or shasum to verify the Python tarball" >&2
+        return 1
+    fi
+}
+
 # --- doctor ---------------------------------------------------------------------
 
 failures=0
@@ -113,35 +149,160 @@ check_cli() {
     fi
 }
 
-system_pkg_hint() { # package -> install command for this OS
-    if [ "$(host_os)" = macos ]; then echo "xcode-select --install"; else echo "sudo apt install $1 (or your distro's equivalent)"; fi
+system_pkg_hint() { # apt_package dnf_package [macos_hint] -> install command for this OS
+    local apt_pkg="${1:?}" dnf_pkg="${2:-$1}" macos_hint="${3:-xcode-select --install}"
+    if [ "$(host_os)" = macos ]; then
+        echo "$macos_hint"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "sudo dnf install $dnf_pkg"
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "sudo apt install $apt_pkg"
+    else
+        echo "install $apt_pkg (or your distro's equivalent)"
+    fi
 }
 
-check_c_compiler() { # the Python wheel's C extension is built by setuptools with the system compiler
-    [ "$(host_os)" = unsupported ] && return # e.g. Windows: setuptools uses MSVC, not cc
-    command -v cc >/dev/null && ok "C compiler: $(command -v cc)" || bad "no C compiler (cc) found" "$(system_pkg_hint build-essential)"
+check_c_compiler() { # native builds and the Python wheel's C extension need a compiler/linker
+    [ "$(host_os)" = unsupported ] && return # e.g. Windows: the toolchain uses MSVC, not cc
+    command -v cc >/dev/null && ok "C compiler: $(command -v cc)" || bad "no C compiler (cc) found" "$(system_pkg_hint build-essential gcc)"
 }
 
 check_clang() { # boltffi links the JNI desktop library with clang on Linux and macOS
     [ "$(host_os)" = unsupported ] && return
-    command -v clang >/dev/null && ok "clang" || bad "clang not found (boltffi uses it to link the JNI library)" "$(system_pkg_hint clang)"
+    command -v clang >/dev/null && ok "clang" || bad "clang not found (boltffi uses it to link the JNI library)" "$(system_pkg_hint clang clang)"
 }
 
-check_python_venv() {
-    local py="${PYTHON:-python3}"
-    if ! command -v "$py" >/dev/null; then
-        bad "$py not found" "make bind-python"
-    elif ! "$py" -c 'import venv, ensurepip' 2>/dev/null; then
-        bad "$py has no working venv module (e.g. Debian/Ubuntu without python3-venv)" "make bind-python"
+python_runtime_problem() { # command -> prints why it is not wheel-build ready; 0 when ready
+    local py="${1:?}" version include platinclude
+    if ! command -v "$py" >/dev/null 2>&1; then
+        echo "$py not found"
+        return 1
+    fi
+    version="$("$py" --version 2>&1)"
+    "$py" -c 'import sys; raise SystemExit(0 if sys.version_info[:3] >= tuple(int(part) for part in sys.argv[1].split(".")) else 1)' \
+        "$PYTHON_MIN_VERSION" >/dev/null 2>&1 || {
+        echo "$version is older than $PYTHON_MIN_VERSION"
+        return 1
+    }
+    "$py" -c 'import venv, ensurepip' >/dev/null 2>&1 || {
+        echo "$version has no working venv/ensurepip module"
+        return 1
+    }
+    "$py" -m pip --version >/dev/null 2>&1 || {
+        echo "$version has no working pip module"
+        return 1
+    }
+    include="$("$py" -c 'import sysconfig; print(sysconfig.get_paths().get("include", ""))' 2>/dev/null || true)"
+    platinclude="$("$py" -c 'import sysconfig; print(sysconfig.get_paths().get("platinclude", ""))' 2>/dev/null || true)"
+    if { [ -n "$include" ] && [ -f "$include/Python.h" ]; } ||
+        { [ -n "$platinclude" ] && [ -f "$platinclude/Python.h" ]; }; then
+        :
     else
-        ok "$("$py" --version) with venv"
+        echo "$version has no Python.h (development headers missing)"
+        return 1
+    fi
+    "$py" -c 'import ssl, zlib' >/dev/null 2>&1 || {
+        echo "$version has no working ssl/zlib modules (pip cannot download or unpack wheels)"
+        return 1
+    }
+    return 0
+}
+
+check_python_runtime() {
+    local py="${PYTHON:-$PYTHON_BIN}" problem
+    problem="$(python_runtime_problem "$py" 2>&1 || true)"
+    if [ -z "$problem" ]; then
+        ok "$("$py" --version 2>&1) with venv, pip, headers, ssl and zlib"
+    else
+        bad "Python is not wheel-build ready: $problem" "make bind-python"
     fi
 }
 
 check_python() {
     echo "python"
-    check_python_venv
+    check_python_runtime
     check_c_compiler
+}
+
+python_command() { # the interpreter the Python targets must use (never the system one)
+    if [ -n "${PYTHON:-}" ]; then
+        if [ -x "$PYTHON" ] || command -v "$PYTHON" >/dev/null 2>&1; then
+            printf '%s\n' "$PYTHON"
+            return 0
+        fi
+        return 1
+    fi
+    [ -x "$PYTHON_BIN" ] || return 1
+    printf '%s\n' "$PYTHON_BIN"
+}
+
+macos_openssl_prefix() { # Homebrew's OpenSSL 3, which macOS does not ship
+    if [ "$(host_os)" = macos ] && command -v brew >/dev/null 2>&1; then
+        brew --prefix openssl@3 2>/dev/null || true
+    fi
+}
+
+python_build_hint() { # dependency -> distro-neutral install examples
+    case "$1" in
+        zlib)
+            cat <<'EOF'
+  Debian/Ubuntu: sudo apt install zlib1g-dev
+  Fedora/RHEL:   sudo dnf install zlib-devel
+  Arch:          sudo pacman -S zlib
+  openSUSE:      sudo zypper install zlib-devel
+EOF
+            ;;
+        openssl)
+            cat <<'EOF'
+  Debian/Ubuntu: sudo apt install libssl-dev
+  Fedora/RHEL:   sudo dnf install openssl-devel
+  Arch:          sudo pacman -S openssl
+  openSUSE:      sudo zypper install libopenssl-devel
+  macOS:         brew install openssl@3
+EOF
+            ;;
+        *)
+            cat <<'EOF'
+  Debian/Ubuntu: sudo apt install build-essential curl
+  Fedora/RHEL:   sudo dnf install gcc make curl
+  Arch:          sudo pacman -S base-devel curl
+  openSUSE:      sudo zypper install gcc make curl
+EOF
+            ;;
+    esac
+}
+
+require_python_build_deps() {
+    local tool missing=0 openssl_prefix ssl_cflags="" ssl_libs="-lssl -lcrypto"
+    for tool in cc make curl tar; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "python: missing build tool: $tool" >&2
+            missing=1
+        fi
+    done
+    if command -v cc >/dev/null 2>&1; then
+        if ! printf '#include <zlib.h>\nint main(void){return 0;}\n' | cc -x c - -o /dev/null >/dev/null 2>&1; then
+            echo "python: missing zlib development headers" >&2
+            python_build_hint zlib >&2
+            missing=1
+        fi
+        openssl_prefix="$(macos_openssl_prefix)"
+        if [ -n "$openssl_prefix" ]; then
+            ssl_cflags="-I$openssl_prefix/include"
+            ssl_libs="-L$openssl_prefix/lib -lssl -lcrypto"
+        fi
+        # shellcheck disable=SC2086 # flags must word-split
+        if ! printf '#include <openssl/ssl.h>\nint main(void){return 0;}\n' |
+            cc -x c $ssl_cflags - $ssl_libs -o /dev/null >/dev/null 2>&1; then
+            echo "python: missing OpenSSL development headers or libraries" >&2
+            python_build_hint openssl >&2
+            missing=1
+        fi
+    fi
+    if [ "$missing" -ne 0 ]; then
+        echo "python: install the packages above, then re-run 'make bind-python'" >&2
+        exit 1
+    fi
 }
 
 check_jdk() {
@@ -191,7 +352,8 @@ check_dart() {
 check_swift() {
     echo "swift"
     if [ "$(host_os)" != macos ]; then
-        bad "the Swift test packs an Apple xcframework, so it needs macOS (CI runs it on macos-latest)" "run it on a Mac"
+        bad "the Swift test packs an Apple xcframework, so it needs macOS (CI runs it on macos-latest)" \
+            "use a Mac, or run 'make test-bind-all' (Swift is skipped on Linux)"
         return
     fi
     command -v xcodebuild >/dev/null && ok "xcodebuild" || bad "xcodebuild not found" "install Xcode from the App Store, then: sudo xcode-select -s /Applications/Xcode.app"
@@ -228,18 +390,88 @@ install_boltffi() {
     cargo install boltffi_cli --version "$want" --locked
 }
 
+python_build_failed() { # log tmpdir
+    echo "python: build failed; last 40 lines of $1:" >&2
+    tail -n 40 "$1" >&2 || true
+    rm -rf "$2"
+    exit 1
+}
+
 install_python() {
-    if passes python_venv; then
-        echo "python: already available ($(${PYTHON:-python3} --version))"
+    if [ -x "$PYTHON_BIN" ] && python_runtime_problem "$PYTHON_BIN" >/dev/null 2>&1; then
+        export PYTHON="$PYTHON_BIN"
+        export PATH="$PYTHON_PREFIX/bin:$PATH"
+        echo "python: already available ($("$PYTHON_BIN" --version 2>&1) at $PYTHON_BIN)"
         return
     fi
     require_supported_host
-    if [ ! -x "$TC_DIR/bin/uv" ]; then
-        curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="$TC_DIR/bin" sh
+    require_python_build_deps
+
+    local openssl_prefix tmp src tarball log actual problem
+    openssl_prefix="$(macos_openssl_prefix)"
+    if [ "$(host_os)" = macos ] && [ -z "$openssl_prefix" ]; then
+        echo "python: warning: OpenSSL 3 was not found via Homebrew; install it with" >&2
+        echo "        'brew install openssl@3' or install Python $PYTHON_VERSION from python.org" >&2
     fi
-    UV_PYTHON_INSTALL_DIR="$TC_DIR/python" "$TC_DIR/bin/uv" python install "$PYTHON_VERSION"
-    ln -sf "$(UV_PYTHON_INSTALL_DIR="$TC_DIR/python" "$TC_DIR/bin/uv" python find "$PYTHON_VERSION")" "$TC_DIR/bin/python3"
-    echo "python: installed $("$TC_DIR/bin/python3" --version) into .toolchains/"
+
+    tmp="$(mktemp -d)"
+    tarball="$tmp/Python-$PYTHON_VERSION.tgz"
+    log="$TC_DIR/python-$PYTHON_VERSION-build.log"
+    : > "$log"
+
+    if ! download "$PYTHON_SOURCE_URL" "$tarball"; then
+        rm -rf "$tmp"
+        exit 1
+    fi
+    if ! actual="$(sha256_file "$tarball")"; then
+        rm -rf "$tmp"
+        exit 1
+    fi
+    if [ "$actual" != "$PYTHON_SHA256" ]; then
+        echo "python: SHA-256 mismatch for $PYTHON_SOURCE_URL" >&2
+        echo "  expected: $PYTHON_SHA256" >&2
+        echo "  actual:   $actual" >&2
+        rm -rf "$tmp"
+        exit 1
+    fi
+
+    echo "  building CPython $PYTHON_VERSION (log: .toolchains/python-$PYTHON_VERSION-build.log)"
+    if ! tar -xzf "$tarball" -C "$tmp"; then
+        rm -rf "$tmp"
+        exit 1
+    fi
+    src="$tmp/Python-$PYTHON_VERSION"
+
+    local -a configure_args=(
+        "--prefix=$PYTHON_PREFIX"
+        --with-ensurepip=install
+        --disable-test-modules
+        --with-system-libmpdec=no
+    )
+    if [ -n "$openssl_prefix" ]; then
+        configure_args+=("--with-openssl=$openssl_prefix")
+    fi
+
+    if ! (cd "$src" && ./configure "${configure_args[@]}") >>"$log" 2>&1; then
+        python_build_failed "$log" "$tmp"
+    fi
+    if ! (cd "$src" && make -j"$(cpu_count)") >>"$log" 2>&1; then
+        python_build_failed "$log" "$tmp"
+    fi
+    rm -rf "$PYTHON_PREFIX"
+    if ! (cd "$src" && make install) >>"$log" 2>&1; then
+        python_build_failed "$log" "$tmp"
+    fi
+    rm -rf "$tmp"
+
+    if ! problem="$(python_runtime_problem "$PYTHON_BIN")"; then
+        echo "python: built Python $PYTHON_VERSION but it is still not wheel-build ready: $problem" >&2
+        echo "        see $log" >&2
+        exit 1
+    fi
+    export PYTHON="$PYTHON_BIN"
+    export PATH="$PYTHON_PREFIX/bin:$PATH"
+    echo "python: installed $("$PYTHON_BIN" --version 2>&1) into .toolchains/python-$PYTHON_VERSION"
 }
 
 install_jdk() {
@@ -354,6 +586,11 @@ case "$cmd" in
     install-boltffi) install_boltffi ;;
     install) install "$@" ;;
     doctor) doctor "$@" ;;
-    run) exec "$@" ;;
+    run)
+        if [ -z "${PYTHON:-}" ] && selected_python="$(python_command)"; then
+            export PYTHON="$selected_python"
+        fi
+        exec "$@"
+        ;;
     *) echo "unknown command: $cmd" >&2; exit 2 ;;
 esac

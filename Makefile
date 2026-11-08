@@ -23,11 +23,14 @@ help:
 	@echo "Bindings:"
 	@echo "  make install-boltffi      install the boltffi CLI version pinned in Cargo.toml"
 	@echo "  make doctor               check every toolchain this host can test, print fix commands"
-	@echo "  make bind-<lang>          install a toolchain into .toolchains/ (no sudo)"
+	@echo "  make bind-<lang>          install a language SDK into .toolchains/ (no sudo)"
+	@echo "  make bind-python          download + build official CPython 3.15.2 from source"
 	@echo "  make bind-all             ... for every language this host can test"
 	@echo "  make test-bind-<lang>     doctor + pack + smoke test one binding"
+	@echo "  make test-bind-python     ... with the CPython built by 'make bind-python'"
 	@echo "  make test-bind-all        ... for every language this host can test ($(HOST_LANGS))"
-	@echo "  <lang> = $(LANGS)"
+	@echo "  <lang> = $(LANGS) (swift needs macOS with Xcode)"
+	@echo "  bind targets install language SDKs only; run 'make doctor' for system packages"
 
 test:
 	cargo test --workspace
@@ -54,6 +57,10 @@ $(addprefix bind-,$(LANGS)): bind-%:
 
 bind-all:
 	@for lang in $(HOST_LANGS); do $(TOOLCHAINS) install $$lang; done
+	@echo
+	@echo "note: bind-all installs language SDKs only; system packages (clang, C compiler,"
+	@echo "      zlib/OpenSSL development headers for the Python build) are not installed."
+	@echo "      Run 'make doctor' to check."
 
 $(addprefix test-bind-,$(LANGS)): test-bind-%: doctor-%
 	@$(RUN_BINDINGS) $*
